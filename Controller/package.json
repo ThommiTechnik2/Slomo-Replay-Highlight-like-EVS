@@ -1,0 +1,13 @@
+{
+  "name": "evs-controller-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "JLCooper SloMo Mini -> evs-playout (UDP)",
+  "scripts": {
+    "start": "node evs-jlcooper.js",
+    "debug": "node evs-jlcooper.js --debug"
+  },
+  "dependencies": {
+    "usb": "^3.1.0"
+  }
+}
