@@ -562,17 +562,9 @@ static void cue_list_preview() {
 }
 
 // Tageszeit eines Ring-Ticks (für die Anzeige "TC IN" der Clips)
-static std::string wallclock_tc_of_tick(uint64_t tick, uint64_t live) {
-    struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
-    double t = static_cast<double>(now.tv_sec) + now.tv_nsec / 1e9 -
-               static_cast<double>(live > tick ? live - tick : 0) / FPS;
-    time_t sec = static_cast<time_t>(t);
-    int ff = static_cast<int>((t - static_cast<double>(sec)) * FPS);
-    struct tm lt;
-    localtime_r(&sec, &lt);
+static std::string wallclock_tc_of_tick(uint64_t tick, uint64_t /*live*/) {
     char b[32];
-    std::snprintf(b, sizeof(b), "%02d:%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec, ff);
+    tick_to_tc(tick, b, sizeof(b));  // der Tick IST die Tageszeit
     return b;
 }
 

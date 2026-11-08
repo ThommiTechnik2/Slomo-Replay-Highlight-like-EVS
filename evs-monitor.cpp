@@ -533,11 +533,9 @@ private:
     }
 
     static QString timecode(uint64_t tick) {
-        uint64_t total_sec = tick / FPS;
-        return QString::asprintf("%02llu:%02llu:%02llu",
-                                 static_cast<unsigned long long>((total_sec / 60) % 60),
-                                 static_cast<unsigned long long>(total_sec % 60),
-                                 static_cast<unsigned long long>(tick % FPS));
+        char b[16];
+        tick_to_tc(tick, b, sizeof(b));  // Tageszeit HH:MM:SS:FF
+        return QString::fromLatin1(b);
     }
 
     // --- Log: alle Messwerte (fps, Lücken, Ring, Anker) landen in monitor-log.txt im Arbeitsordner ---

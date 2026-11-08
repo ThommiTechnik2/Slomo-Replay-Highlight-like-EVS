@@ -73,19 +73,32 @@ void signal_handler(int) {
 }
 
 // --- 50Hz Master-Clock Thread (20.000.000 ns Takt) ---
+// Der Tick ist die Systemzeit in 20-ms-Schritten (siehe evs-common.h). Ein Sprung der Systemuhr
+// (mehr als 1 s) wird gemeldet; rückwärts läuft der Tick nie.
 void master_clock_thread_func(SharedReplayIndex* shm_index) {
-    struct timespec next_tick;
-    clock_gettime(CLOCK_MONOTONIC, &next_tick);
+    uint64_t last = g_master_tick.load();
 
     while (g_running) {
-        next_tick.tv_nsec += 20000000; // +20 ms (50 fps)
-        if (next_tick.tv_nsec >= 1000000000) {
-            next_tick.tv_sec += 1;
-            next_tick.tv_nsec -= 1000000000;
-        }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_tick, nullptr);
+        uint64_t target = last + 1;
+        struct timespec ts;
+        ts.tv_sec = static_cast<time_t>(target / FPS);
+        ts.tv_nsec = static_cast<long>((target % FPS) * (1000000000ULL / FPS));
+        clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts, nullptr);
 
-        uint64_t tick = ++g_master_tick;
+        uint64_t now = realtime_tick_now();
+        if (now + FPS < target) {
+            // Systemuhr ist deutlich zurückgesprungen: Ticks nicht rückwärts laufen lassen, kurz warten
+            std::cerr << "\n[WARN] Systemuhr ist zurückgesprungen (" << (target - now) / FPS
+                      << " s). Tick pausiert, bis die Uhr aufgeholt hat.\n";
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        if (now > target + FPS)
+            std::cerr << "\n[WARN] Systemuhr bzw. Ingest hat " << (now - target) / FPS << " s übersprungen.\n";
+
+        uint64_t tick = std::max(now, target);
+        last = tick;
+        g_master_tick.store(tick, std::memory_order_release);
         shm_index->current_master_tick.store(tick, std::memory_order_release);
     }
 }
@@ -526,7 +539,15 @@ int main(int argc, char* argv[]) {
     shm_index->active_channels.store(static_cast<uint32_t>(num_rec));
     std::cout << "[INIT] " << num_rec << " REC-Wege\n";
 
-    // 2. 50Hz Master-Clock starten
+    // 2. 50Hz Master-Clock starten (Tick = Systemzeit, Tageszeit-Timecode)
+    g_master_tick.store(realtime_tick_now());
+    shm_index->current_master_tick.store(g_master_tick.load());
+    {
+        char tcb[16];
+        tick_to_tc(g_master_tick.load(), tcb, sizeof(tcb));
+        std::cout << "[INIT] Zeitquelle: Systemuhr (Tageszeit " << tcb
+                  << "). Uhr per chrony/NTP synchron halten!\n";
+    }
     std::thread clock_thread(master_clock_thread_func, shm_index);
 
     // 3. Die SRT-Kanäle initialisieren und starten
@@ -550,13 +571,11 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         uint64_t tick = g_master_tick.load();
         
-        // Formatiere Master-Tick als Timecode (MM:SS:FF)
-        uint64_t total_sec = tick / FPS;
-        uint64_t frames = tick % FPS;
-        uint64_t mins = (total_sec / 60) % 60;
-        uint64_t secs = total_sec % 60;
+        // Master-Tick als Tageszeit-Timecode (HH:MM:SS:FF)
+        char tcb[16];
+        tick_to_tc(tick, tcb, sizeof(tcb));
 
-        printf("\r[TC %02lu:%02lu:%02lu] Frames Ingested | ", mins, secs, frames);
+        printf("\r[TC %s] Frames Ingested | ", tcb);
         for (size_t i = 0; i < num_rec; ++i) {
             double mb_pos = static_cast<double>(channels[i].current_write_offset) / (1024.0 * 1024.0);
             printf("REC%zu: %lu (%.0fMB, G%u, A%lu, T%lu)  ", i + 1, channels[i].frames_received, mb_pos,

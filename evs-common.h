@@ -6,7 +6,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <unistd.h>
 
 // --- System-Konstanten ---
@@ -48,6 +50,24 @@ constexpr uint32_t AUDIO_SAMPLES_PER_FRAME = AUDIO_RATE / FPS;  // 960
 constexpr size_t AUDIO_PAYLOAD_BYTES = AUDIO_SAMPLES_PER_FRAME * AUDIO_CHANNELS * sizeof(int32_t);  // 7680
 constexpr size_t AUDIO_SLOT_BYTES = sizeof(uint64_t) + AUDIO_PAYLOAD_BYTES;
 constexpr uint64_t AUDIO_FILE_BYTES = static_cast<uint64_t>(TOTAL_SLOTS) * AUDIO_SLOT_BYTES;
+
+// --- Echtzeit als Zeitquelle ---
+// Ein Tick ist ein 20-ms-Schritt der Systemuhr (CLOCK_REALTIME): tick = Sekunden seit 1970 * 50 + Frame.
+// Dadurch ist der Timecode überall die Tageszeit (HH:MM:SS:FF, lokale Zeit) und über Neustarts hinweg
+// eindeutig. Die Systemuhr sollte per chrony/NTP/PTP diszipliniert sein (nur Gleiten, kein Springen).
+inline uint64_t realtime_tick_now() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * FPS + static_cast<uint64_t>(ts.tv_nsec) / (1000000000ULL / FPS);
+}
+
+// Tick -> "HH:MM:SS:FF" (lokale Zeit)
+inline void tick_to_tc(uint64_t tick, char* buf, size_t n) {
+    time_t sec = static_cast<time_t>(tick / FPS);
+    struct tm lt;
+    localtime_r(&sec, &lt);
+    std::snprintf(buf, n, "%02d:%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec, static_cast<int>(tick % FPS));
+}
 
 // --- Frame-Index (Ingest -> Playout/Monitor) ---
 // Seqlock-Prinzip: master_tick ist der Commit-Marker.
