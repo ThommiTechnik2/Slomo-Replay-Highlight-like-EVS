@@ -259,7 +259,7 @@ Textzeilen an `127.0.0.1:20200`, die Antwort kommt an den Absender zurück. Mehr
 
 ## Bekannte Grenzen
 
-- DeckLink-Ausgang (`PLAYOUT_MODE=2`) und SDI-Eingang sowie der NVIDIA-Pfad sind nicht an echter Hardware getestet.
+- DeckLink-Ausgang (`PLAYOUT_MODE=2`) und SDI-Eingang sowie der NVIDIA-Pfad sind noch(!) nicht an echter Hardware getestet.
 - SDI-Eingang nur mit progressiven Modi (kein Entflechten von 1080i).
 - Listen schneiden hart zwischen Clips (keine Blenden).
 - Keine Portierung auf macOS (geplant).
