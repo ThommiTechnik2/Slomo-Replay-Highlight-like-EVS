@@ -74,7 +74,7 @@ constexpr uint32_t MAX_SANE_FRAME_BYTES = 32u * 1024 * 1024;
 // die CPU bekommt nur noch das kleine Bild. Ohne passende Hardware: Software (avdec_h264).
 // Erzwingen von Software:  evs-monitor --no-hw
 // ---------------------------------------------------------------------------------------------
-enum class DecodePath { Software, VA, VAAPI };
+enum class DecodePath { Software, VA, VAAPI, NV };
 static DecodePath g_decode = DecodePath::Software;
 
 static bool has_element(const char* name) {
@@ -84,19 +84,30 @@ static bool has_element(const char* name) {
 }
 
 static void choose_decode_path(bool allow_hw) {
-    if (allow_hw && has_element("vah264dec") && has_element("vapostproc")) g_decode = DecodePath::VA;
-    else if (allow_hw && has_element("vaapih264dec") && has_element("vaapipostproc")) g_decode = DecodePath::VAAPI;
+    const std::string pref = hw_preference();
+    const bool want_nv = pref.empty() || pref == "nv";
+    const bool want_va = pref.empty() || pref == "va";
+    if (allow_hw && want_nv && has_element("nvh264dec")) g_decode = DecodePath::NV;
+    else if (allow_hw && want_va && has_element("vah264dec") && has_element("vapostproc")) g_decode = DecodePath::VA;
+    else if (allow_hw && want_va && has_element("vaapih264dec") && has_element("vaapipostproc")) g_decode = DecodePath::VAAPI;
     else g_decode = DecodePath::Software;
 }
 
 static const char* decode_name(DecodePath p) {
-    return p == DecodePath::VA ? "Quick Sync (va)" : p == DecodePath::VAAPI ? "Quick Sync (vaapi)" : "Software";
+    return p == DecodePath::NV ? "NVIDIA NVDEC" : p == DecodePath::VA ? "Quick Sync (va)"
+         : p == DecodePath::VAAPI ? "Quick Sync (vaapi)" : "Software";
 }
 
 // Decoder-Kette von h264parse bis zum RGB-Bild in der gewünschten Größe
 static std::string decode_chain(DecodePath p, int w, int h) {
     const std::string size = "width=" + std::to_string(w) + ",height=" + std::to_string(h);
     switch (p) {
+        case DecodePath::NV:
+            // Verkleinern auf der Grafikkarte (cudascale), falls das Plugin es kann; sonst in der CPU
+            if (has_element("cudascale") && has_element("cudadownload"))
+                return "h264parse ! nvh264dec ! cudascale ! video/x-raw(memory:CUDAMemory)," + size +
+                       " ! cudadownload ! videoconvert ! video/x-raw,format=RGB," + size;
+            return "h264parse ! nvh264dec ! videoscale ! videoconvert ! video/x-raw,format=RGB," + size;
         case DecodePath::VA:
             return "h264parse ! vah264dec ! vapostproc ! video/x-raw," + size +
                    " ! videoconvert ! video/x-raw,format=RGB," + size;

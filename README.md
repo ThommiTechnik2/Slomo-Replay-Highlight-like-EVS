@@ -105,6 +105,9 @@ Einstellungen am Anfang von `evs-start.sh`:
 | `PLAYOUT_MODE` | 0 = Fenster, 1 = SRT-Rückweg PGM (Port 20100), 2 = DeckLink (ungetestet), 3 = nur Monitor |
 | `NAMES` | Kameranamen für den Multiview, durch Semikolon getrennt, REC 1 bis 6, z. B. `"Mitte;16er Hoch;Tor links;Tor rechts;Halbtotale;Spielfeld"` |
 | `CONTROLLER_DIR` | Ordner der Controller-Brücke (leer lassen = Brücke nicht starten) |
+| `INPUT` | Quelle der REC-Wege: `srt` (OBS, Standard), `sdi` (Blackmagic DeckLink, REC 1 = Anschluss 0 …), `test` (Testbild + Ton ohne Kamera) oder pro REC einzeln, z. B. `"sdi,sdi,sdi,sdi,srt,srt"` bzw. `"sdi:2,sdi:3"` für bestimmte Anschlüsse |
+| `SDI_MODE` | Videomodus der SDI-Eingänge, Standard `1080p50` (nur progressive Modi) |
+| `HW` | Hardware-Beschleunigung erzwingen: `nv` (NVIDIA), `va` (Intel Quick Sync), `sw` (Software). Leer = automatisch in dieser Reihenfolge |
 
 Beenden: Ingest mit Strg+C, Playout mit `q`. Alle drei Programme sollten nach einem Neustart des Ingest ebenfalls neu gestartet werden (das Skript räumt den Shared Memory dazu auf).
 
@@ -247,9 +250,17 @@ Textzeilen an `127.0.0.1:20200`, die Antwort kommt an den Absender zurück. Mehr
 | Viele Lücken oder Anker | Last prüfen, auf der OBS-Seite Encoder-Last und nicht genutzte Ausgänge prüfen, Netzwerk prüfen, Log (`monitor-log.txt`) auswerten. |
 | Rückweg ruckelt | In OBS keine Hardware-Dekodierung, Rückweg ohne B-Frames (ist im Playout so eingestellt). |
 
+## SDI-Eingang, Tageszeit und Grafikkarte
+
+- **SDI statt SRT:** `./evs-start-sdi.sh` startet 6 REC-Wege über die Blackmagic DeckLink. Voraussetzungen: Blackmagic Desktop Video installiert, die Anschlüsse in *Desktop Video Setup* als Eingang gestellt, ein GStreamer mit DeckLink-Plugin (`gst-inspect-1.0 decklinkvideosrc`). Der Ingest kodiert das unkomprimierte Bild selbst zu All-Intra-H.264 (90 Mbit/s) mit NVIDIA NVENC, sonst Intel Quick Sync, sonst x264 (Software, sehr rechenintensiv). Ton: eingebettet, Kanal 1/2. Quellen lassen sich mischen (`INPUT="sdi,sdi,sdi,sdi,srt,srt"`).
+- **Tageszeit als Zeitquelle:** Der Timecode ist überall die Tageszeit (`HH:MM:SS:FF`, lokale Zeit): Ein Tick ist ein 20-ms-Schritt der Systemuhr. Die Systemuhr sollte mit `chrony` synchron gehalten werden (`chronyc tracking`). Clips aus früheren Sitzungen haben noch alte Tick-Werte; ihre Spalte „TC IN“ ist dann unbrauchbar.
+- **NVIDIA-Grafikkarte:** Monitor und Playout nutzen NVDEC/NVENC (`gst-inspect-1.0 nvh264dec nvh264enc` muss die Elemente zeigen, Paket `gstreamer1.0-plugins-bad` und der proprietäre NVIDIA-Treiber). Fehlt die Hardware, läuft alles in Software.
+- **Testquelle:** `INPUT="test"` liefert Testbild und Ton pro REC-Weg, um das System ohne Kamera auszuprobieren.
+
 ## Bekannte Grenzen
 
-- DeckLink-Ausgang (`PLAYOUT_MODE=2`) ist nicht getestet.
+- DeckLink-Ausgang (`PLAYOUT_MODE=2`) und SDI-Eingang sowie der NVIDIA-Pfad sind nicht an echter Hardware getestet.
+- SDI-Eingang nur mit progressiven Modi (kein Entflechten von 1080i).
 - Listen schneiden hart zwischen Clips (keine Blenden).
 - Keine Portierung auf macOS (geplant).
 - Der T-Bar meldet seine Position erst bei der ersten Bewegung. Bis dahin gilt 100 %.
@@ -360,6 +371,9 @@ Settings at the top of `evs-start.sh`:
 | `PLAYOUT_MODE` | 0 = window, 1 = SRT return PGM (port 20100), 2 = DeckLink (untested), 3 = monitor only |
 | `NAMES` | Camera names for the multiview, separated by semicolons, REC 1 to 6, e.g. `"Center;High 16;Goal left;Goal right;Wide;Pitch"` |
 | `CONTROLLER_DIR` | Folder of the controller bridge (leave empty to not start the bridge) |
+| `INPUT` | Source of the REC channels: `srt` (OBS, default), `sdi` (Blackmagic DeckLink, REC 1 = connector 0 …), `test` (test picture + tone, no camera needed) or per REC, e.g. `"sdi,sdi,sdi,sdi,srt,srt"` or `"sdi:2,sdi:3"` for specific connectors |
+| `SDI_MODE` | Video mode of the SDI inputs, default `1080p50` (progressive modes only) |
+| `HW` | Force hardware acceleration: `nv` (NVIDIA), `va` (Intel Quick Sync), `sw` (software). Empty = automatic in this order |
 
 To stop: Ctrl+C in the ingest, `q` in the playout. After restarting the ingest, restart all three programs (the script cleans up the shared memory for this).
 
@@ -502,9 +516,17 @@ Text lines to `127.0.0.1:20200`; the reply goes back to the sender. Several line
 | Many gaps or anchors | Check the load, check encoder load and unused outputs on the OBS side, check the network, evaluate the log (`monitor-log.txt`). |
 | Return path judders | No hardware decoding in OBS; the return path has no B-frames (set that way in the playout). |
 
+## SDI input, time of day and graphics card
+
+- **SDI instead of SRT:** `./evs-start-sdi.sh` starts 6 REC channels through the Blackmagic DeckLink. Requirements: Blackmagic Desktop Video installed, the connectors set to input in *Desktop Video Setup*, and a GStreamer with the DeckLink plugin (`gst-inspect-1.0 decklinkvideosrc`). The ingest encodes the uncompressed picture itself to all-intra H.264 (90 Mbit/s) with NVIDIA NVENC, otherwise Intel Quick Sync, otherwise x264 (software, very CPU-hungry). Audio: embedded, channels 1/2. Sources can be mixed (`INPUT="sdi,sdi,sdi,sdi,srt,srt"`).
+- **Time of day as time source:** The timecode is the time of day everywhere (`HH:MM:SS:FF`, local time): a tick is a 20 ms step of the system clock. Keep the system clock in sync with `chrony` (`chronyc tracking`). Clips from earlier sessions still hold old tick values; their "TC IN" column is meaningless.
+- **NVIDIA graphics card:** Monitor and playout use NVDEC/NVENC (`gst-inspect-1.0 nvh264dec nvh264enc` must show the elements; package `gstreamer1.0-plugins-bad` and the proprietary NVIDIA driver). Without the hardware everything runs in software.
+- **Test source:** `INPUT="test"` delivers a test picture and tone per REC channel to try the system without a camera.
+
 ## Known limitations
 
-- The DeckLink output (`PLAYOUT_MODE=2`) is untested.
+- The DeckLink output (`PLAYOUT_MODE=2`), the SDI input and the NVIDIA path are not tested on real hardware.
+- SDI input supports progressive modes only (no deinterlacing of 1080i).
 - Lists cut hard between clips (no dissolves).
 - No macOS port yet (planned).
 - The T-bar reports its position only after the first movement. Until then 100 % applies.

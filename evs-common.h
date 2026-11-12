@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <unistd.h>
@@ -50,6 +51,14 @@ constexpr uint32_t AUDIO_SAMPLES_PER_FRAME = AUDIO_RATE / FPS;  // 960
 constexpr size_t AUDIO_PAYLOAD_BYTES = AUDIO_SAMPLES_PER_FRAME * AUDIO_CHANNELS * sizeof(int32_t);  // 7680
 constexpr size_t AUDIO_SLOT_BYTES = sizeof(uint64_t) + AUDIO_PAYLOAD_BYTES;
 constexpr uint64_t AUDIO_FILE_BYTES = static_cast<uint64_t>(TOTAL_SLOTS) * AUDIO_SLOT_BYTES;
+
+// --- Wahl der Hardware-Beschleunigung ---
+// Umgebungsvariable EVS_HW: "nv" (NVIDIA NVDEC/NVENC), "va" (Intel Quick Sync), "sw" (nur Software).
+// Ohne Angabe: NVIDIA, wenn vorhanden, sonst Intel, sonst Software.
+inline const char* hw_preference() {
+    const char* v = std::getenv("EVS_HW");
+    return v ? v : "";
+}
 
 // --- Echtzeit als Zeitquelle ---
 // Ein Tick ist ein 20-ms-Schritt der Systemuhr (CLOCK_REALTIME): tick = Sekunden seit 1970 * 50 + Frame.

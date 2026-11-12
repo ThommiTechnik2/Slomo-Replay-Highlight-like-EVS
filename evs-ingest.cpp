@@ -37,6 +37,11 @@ std::atomic<uint64_t> g_master_tick{0};
 struct ChannelContext {
     int cam_id;
     int srt_port;
+    // Quelle dieses REC-Wegs: "srt" (OBS ruft an), "sdi" (Blackmagic DeckLink) oder "test" (Testbild + Ton)
+    std::string input = "srt";
+    int sdi_dev = 0;                 // DeckLink-Gerätenummer (Anschluss), nur bei "sdi"
+    std::string sdi_mode = "1080p50";
+    bool warned_delta = false;       // Warnung "kein All-Intra" schon ausgegeben
     int fd = -1;
     uint64_t current_write_offset = 0;
     uint32_t generation = 0;
@@ -207,6 +212,11 @@ static GstFlowReturn on_new_sample(GstAppSink* appsink, gpointer user_data) {
 
                 size_t slot_idx = static_cast<uint64_t>(synced_tick) % TOTAL_SLOTS;
                 bool is_key = !GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+                if (!is_key && !ctx->warned_delta) {
+                    ctx->warned_delta = true;
+                    std::cerr << "\n[WARN] REC" << (ctx->cam_id + 1)
+                              << ": Quelle liefert keine reinen I-Frames – Wiedergabe/Shuttle braucht All-Intra!\n";
+                }
 
                 // In Shared-Memory-Index eintragen (Seqlock: erst ungültig, Felder, dann Commit)
                 FrameSlot& slot = ctx->shm_index->slots[ctx->cam_id][slot_idx];
@@ -384,6 +394,144 @@ static void on_demux_pad_added(GstElement*, GstPad* new_pad, gpointer user_data)
     gst_caps_unref(caps);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Live-Quellen ohne Netzwerk: SDI (Blackmagic DeckLink) und Testquelle.
+// Das Bild kommt unkomprimiert und wird hier zu All-Intra-H.264 (jedes Bild ein I-Frame) kodiert,
+// danach läuft alles wie bei SRT: Ring-Datei, Index, Ton-Ring. Ton: eingebettet, Kanal 1/2.
+// ---------------------------------------------------------------------------------------------
+static bool has_element(const char* name) {
+    GstElementFactory* f = gst_element_factory_find(name);
+    if (f) gst_object_unref(f);
+    return f != nullptr;
+}
+
+// Setzt eine Eigenschaft (auch Aufzählungen, per Text) nur, wenn das Element sie kennt
+static bool set_arg_if_exists(GstElement* e, const std::string& prop, const std::string& val) {
+    if (!g_object_class_find_property(G_OBJECT_GET_CLASS(e), prop.c_str())) return false;
+    gst_util_set_object_arg(G_OBJECT(e), prop.c_str(), val.c_str());
+    return true;
+}
+
+typedef std::vector<std::pair<std::string, std::string>> Props;
+
+// All-Intra-Encoder: NVIDIA NVENC, Intel Quick Sync, sonst x264 (Software, sehr rechenintensiv).
+// Auswahl erzwingen mit der Umgebungsvariable EVS_HW=nv|va|sw.
+static std::string pick_intra_encoder(int kbps, std::string& label, Props& props) {
+    const std::string pref = hw_preference();
+    const std::string br = std::to_string(kbps);
+    if ((pref.empty() || pref == "nv") && has_element("nvh264enc")) {
+        label = "NVIDIA NVENC";
+        props = {{"bitrate", br}, {"gop-size", "1"}, {"bframes", "0"}, {"rc-mode", "cbr"}, {"zerolatency", "true"}};
+        return "nvh264enc name=venc";
+    }
+    if (pref != "sw" && pref != "nv" && has_element("vah264enc")) {
+        label = "Intel Quick Sync (va)";
+        props = {{"bitrate", br}, {"key-int-max", "1"}, {"b-frames", "0"}, {"rate-control", "cbr"}};
+        return "vah264enc name=venc";
+    }
+    if (pref != "sw" && pref != "nv" && has_element("vaapih264enc")) {
+        label = "Intel Quick Sync (vaapi)";
+        props = {{"bitrate", br}, {"keyframe-period", "1"}, {"max-bframes", "0"}, {"rate-control", "cbr"}};
+        return "vaapih264enc name=venc";
+    }
+    label = "Software (x264) – sehr rechenintensiv";
+    props = {{"bitrate", br}, {"key-int-max", "1"}, {"bframes", "0"}, {"tune", "zerolatency"},
+             {"speed-preset", "ultrafast"}};
+    return "x264enc name=venc";
+}
+
+constexpr int INTRA_KBPS = 90000;  // wie die OBS-Streams (~92 Mbit/s); Ring-Größe in evs-common.h beachten
+
+static bool init_live_pipeline(ChannelContext& ctx) {
+    const std::string cam = "REC" + std::to_string(ctx.cam_id + 1);
+    std::string vsrc, asrc;
+
+    if (ctx.input == "sdi") {
+        if (!has_element("decklinkvideosrc") || !has_element("decklinkaudiosrc")) {
+            std::cerr << "[Fehler] " << cam << ": GStreamer-Plugin für DeckLink fehlt "
+                         "(prüfen: gst-inspect-1.0 decklinkvideosrc; Blackmagic Desktop Video installiert?)\n";
+            return false;
+        }
+        if (ctx.sdi_mode.find('i') != std::string::npos && ctx.sdi_mode.find("p") == std::string::npos)
+            std::cerr << "[WARN] " << cam << ": Zeilensprung-Modus " << ctx.sdi_mode
+                      << " wird nicht entflochten – nur progressive Modi (z.B. 1080p50) werden unterstützt.\n";
+        vsrc = "decklinkvideosrc name=vsrc device-number=" + std::to_string(ctx.sdi_dev) + " mode=" + ctx.sdi_mode;
+        asrc = "decklinkaudiosrc name=asrc device-number=" + std::to_string(ctx.sdi_dev) + " channels=2";
+    } else {  // "test"
+        vsrc = "videotestsrc name=vsrc is-live=true pattern=ball ! "
+               "video/x-raw,width=1920,height=1080,framerate=50/1";
+        asrc = "audiotestsrc name=asrc is-live=true wave=sine volume=0.2 freq=" +
+               std::to_string(440 + 110 * ctx.cam_id) + " ! audio/x-raw,rate=48000,channels=2";
+    }
+
+    std::string label;
+    Props props;
+    const std::string enc = pick_intra_encoder(INTRA_KBPS, label, props);
+
+    // Warteschlange zwischen Karte und Encoder: höchstens 25 unkomprimierte Bilder (~100 MB), Überlauf = Bild verwerfen
+    std::string desc =
+        vsrc + " ! queue max-size-buffers=25 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
+        "videoconvert ! video/x-raw,format=NV12 ! " + enc +
+        " ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! "
+        "appsink name=sink";
+    if (ctx.afd >= 0)
+        desc += " " + asrc +
+                " ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=2000000000 ! audioconvert ! "
+                "audioresample ! audio/x-raw,format=S32LE,rate=48000,channels=2,layout=interleaved ! "
+                "appsink name=asink";
+
+    GError* err = nullptr;
+    ctx.pipeline = gst_parse_launch(desc.c_str(), &err);
+    if (err || !ctx.pipeline) {
+        std::cerr << "[Fehler] " << cam << ": Pipeline: " << (err ? err->message : "unbekannt") << "\n";
+        if (err) g_error_free(err);
+        if (ctx.pipeline) { gst_object_unref(ctx.pipeline); ctx.pipeline = nullptr; }
+        return false;
+    }
+
+    if (GstElement* venc = gst_bin_get_by_name(GST_BIN(ctx.pipeline), "venc")) {
+        for (auto& p : props) set_arg_if_exists(venc, p.first, p.second);
+        gst_object_unref(venc);
+    }
+
+    GstElement* vsink = gst_bin_get_by_name(GST_BIN(ctx.pipeline), "sink");
+    if (!vsink) return false;
+    g_object_set(G_OBJECT(vsink), "emit-signals", FALSE, "sync", FALSE, "async", FALSE,
+                 "max-buffers", 8, "drop", TRUE, nullptr);
+    GstAppSinkCallbacks vcb = {};
+    vcb.new_sample = on_new_sample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(vsink), &vcb, &ctx, nullptr);
+    gst_object_unref(vsink);
+
+    if (GstElement* asink = gst_bin_get_by_name(GST_BIN(ctx.pipeline), "asink")) {
+        g_object_set(G_OBJECT(asink), "emit-signals", FALSE, "sync", FALSE, "async", FALSE,
+                     "max-buffers", 200, "drop", FALSE, nullptr);
+        GstAppSinkCallbacks acb = {};
+        acb.new_sample = on_new_audio;
+        gst_app_sink_set_callbacks(GST_APP_SINK(asink), &acb, &ctx, nullptr);
+        gst_object_unref(asink);
+    }
+
+    std::cout << "[INIT] " << cam << ": " << (ctx.input == "sdi" ? "SDI Anschluss " + std::to_string(ctx.sdi_dev) +
+                 " (" + ctx.sdi_mode + ")" : std::string("Testquelle"))
+              << ", All-Intra " << INTRA_KBPS / 1000 << " Mbit/s, Encoder: " << label << "\n";
+
+    if (gst_element_set_state(ctx.pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+        std::cerr << "[Fehler] " << cam << ": Quelle lässt sich nicht starten"
+                  << (ctx.input == "sdi"
+                          ? " – DeckLink-Anschluss " + std::to_string(ctx.sdi_dev) +
+                                " nicht gefunden oder belegt? (Desktop Video installiert, Anschluss in Desktop "
+                                "Video Setup als Eingang gestellt, Modus " + ctx.sdi_mode + " passend?)"
+                          : std::string(""))
+                  << "\n";
+        gst_element_set_state(ctx.pipeline, GST_STATE_NULL);
+        gst_object_unref(ctx.pipeline);
+        ctx.pipeline = nullptr;
+        return false;
+    }
+    return true;
+}
+
 // --- Aufbau der GStreamer SRT-Pipeline für einen Kanal ---
 bool init_channel_pipeline(ChannelContext& ctx) {
     mkdir(STORAGE_DIR, 0777);
@@ -406,6 +554,8 @@ bool init_channel_pipeline(ChannelContext& ctx) {
         std::cerr << "[WARN] REC" << (ctx.cam_id + 1) << ": Ton-Datei nicht nutzbar (" << apath << "), nur Bild\n";
         if (ctx.afd >= 0) { close(ctx.afd); ctx.afd = -1; }
     }
+
+    if (ctx.input != "srt") return init_live_pipeline(ctx);
 
     ctx.pipeline = gst_pipeline_new(("srt-cam-" + std::to_string(ctx.cam_id)).c_str());
     GstElement* srtsrc    = gst_element_factory_make("srtsrc", "src");
@@ -531,10 +681,50 @@ int main(int argc, char* argv[]) {
     std::memset(static_cast<void*>(shm_index), 0, sizeof(SharedReplayIndex));
 
     // Anzahl der REC-Wege: evs-ingest 4   oder   evs-ingest 6   (Standard 6)
+    // Quellen:  --input srt        alle per SRT (Standard)
+    //           --input sdi        alle per SDI, REC n = DeckLink-Anschluss n-1
+    //           --input sdi,sdi,srt,srt,sdi:6,test    pro REC-Weg einzeln ("sdi:K" = Anschluss K, 0-basiert)
+    //           --sdi-mode 1080p50  Videomodus der SDI-Eingänge (Standard 1080p50)
+    // (auch per Umgebungsvariable EVS_INPUT)
     size_t num_rec = NUM_CHANNELS;
+    std::string input_spec = std::getenv("EVS_INPUT") ? std::getenv("EVS_INPUT") : "srt";
+    std::string sdi_mode = "1080p50";
     for (int a = 1; a < argc; ++a) {
+        std::string arg = argv[a];
+        if (arg == "--input" && a + 1 < argc) { input_spec = argv[++a]; continue; }
+        if (arg == "--sdi-mode" && a + 1 < argc) { sdi_mode = argv[++a]; continue; }
         int v = std::atoi(argv[a]);
         if (v >= 1 && v <= static_cast<int>(NUM_CHANNELS)) num_rec = static_cast<size_t>(v);
+    }
+
+    // Quellen pro REC-Weg auflösen
+    std::vector<std::string> in_kind(NUM_CHANNELS, "srt");
+    std::vector<int> in_dev(NUM_CHANNELS, 0);
+    {
+        std::vector<std::string> tok;
+        size_t p = 0;
+        while (true) {
+            size_t q = input_spec.find(',', p);
+            tok.push_back(input_spec.substr(p, q == std::string::npos ? std::string::npos : q - p));
+            if (q == std::string::npos) break;
+            p = q + 1;
+        }
+        if (tok.size() != 1 && tok.size() != num_rec) {
+            std::cerr << "[Fehler] --input braucht eine Angabe für alle oder " << num_rec
+                      << " Angaben (eine pro REC), hier " << tok.size() << ".\n";
+            return 1;
+        }
+        for (size_t i = 0; i < num_rec; ++i) {
+            const std::string& t = tok.size() == 1 ? tok[0] : tok[i];
+            if (t == "srt") { in_kind[i] = "srt"; }
+            else if (t == "test") { in_kind[i] = "test"; }
+            else if (t == "sdi") { in_kind[i] = "sdi"; in_dev[i] = static_cast<int>(i); }
+            else if (t.rfind("sdi:", 0) == 0) { in_kind[i] = "sdi"; in_dev[i] = std::atoi(t.c_str() + 4); }
+            else {
+                std::cerr << "[Fehler] Unbekannte Quelle '" << t << "' (erlaubt: srt, sdi, sdi:N, test)\n";
+                return 1;
+            }
+        }
     }
     shm_index->active_channels.store(static_cast<uint32_t>(num_rec));
     std::cout << "[INIT] " << num_rec << " REC-Wege\n";
@@ -556,13 +746,17 @@ int main(int argc, char* argv[]) {
         channels[i].cam_id = static_cast<int>(i);
         channels[i].srt_port = SRT_PORTS[i];
         channels[i].shm_index = shm_index;
+        channels[i].input = in_kind[i];
+        channels[i].sdi_dev = in_dev[i];
+        channels[i].sdi_mode = sdi_mode;
 
         if (!init_channel_pipeline(channels[i])) {
             g_running = false;
             break;
         }
-        std::cout << "[INIT] REC " << (i + 1) << ": SRT-Listener auf Port " << SRT_PORTS[i]
-                  << " (Latenz " << SRT_LATENCY_MS << " ms)\n";
+        if (in_kind[i] == "srt")
+            std::cout << "[INIT] REC " << (i + 1) << ": SRT-Listener auf Port " << SRT_PORTS[i]
+                      << " (Latenz " << SRT_LATENCY_MS << " ms)\n";
     }
 
     // 4. Live-Status-Telemetrie in der Konsole
@@ -570,7 +764,23 @@ int main(int argc, char* argv[]) {
     while (g_running) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         uint64_t tick = g_master_tick.load();
-        
+
+        // Fehler der Pipelines melden (z.B. DeckLink-Gerät nicht gefunden, Verbindung verloren)
+        for (size_t i = 0; i < num_rec; ++i) {
+            if (!channels[i].pipeline) continue;
+            GstBus* bus = gst_element_get_bus(channels[i].pipeline);
+            while (GstMessage* m = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR)) {
+                GError* e = nullptr;
+                gchar* dbg = nullptr;
+                gst_message_parse_error(m, &e, &dbg);
+                std::cerr << "\n[FEHLER] REC" << (i + 1) << ": " << (e ? e->message : "unbekannt") << "\n";
+                if (e) g_error_free(e);
+                g_free(dbg);
+                gst_message_unref(m);
+            }
+            gst_object_unref(bus);
+        }
+
         // Master-Tick als Tageszeit-Timecode (HH:MM:SS:FF)
         char tcb[16];
         tick_to_tc(tick, tcb, sizeof(tcb));

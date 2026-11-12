@@ -103,7 +103,7 @@ struct PlayoutEngine {
     GstElement* pipeline = nullptr;
     GstElement* appsrc = nullptr;
     GstElement* audiosrc = nullptr;
-    bool hw_chain = false;                 // Ausgabe läuft über Quick Sync (bei Fehler -> Software)
+    bool hw_chain = false;                 // Ausgabe läuft über Grafik-Hardware (Quick Sync oder NVIDIA) (bei Fehler -> Software)
     int out_mode = 3, out_port = 0, out_dev = 0;
     bool out_speakers = false;
     uint64_t out_tick = 0;  // zählt jeden 50-Hz-Ausgabetakt; gemeinsamer PTS für Bild und Ton
@@ -214,6 +214,10 @@ static void simplify_hw_encoder(GstElement* pipeline) {
 static std::string pick_h264_encoder(int kbps) {
     auto has = has_element;
     const std::string br = std::to_string(kbps);
+    const std::string pref = hw_preference();
+    if ((pref.empty() || pref == "nv") && has("nvh264enc"))
+        return "nvh264enc name=venc bitrate=" + br + " gop-size=50 zerolatency=true";
+    if (pref == "sw") return pick_h264_encoder_sw(kbps);
     if (has("vah264enc"))    return "vah264enc name=venc bitrate=" + br + " key-int-max=50";
     if (has("vaapih264enc")) return "vaapih264enc name=venc bitrate=" + br + " keyframe-period=50";
     return pick_h264_encoder_sw(kbps);
@@ -232,13 +236,22 @@ static void teardown_pipeline(PlayoutEngine& eng) {
 // Bevorzugt bleibt alles auf der Grafikeinheit: dekodieren, umwandeln, kodieren – ohne Umweg über die CPU.
 static std::string srt_video_chain(bool allow_hw, bool& hw_used, std::string& label) {
     const int kbps = 25000;
-    if (allow_hw && has_element("vah264dec") && has_element("vapostproc") && has_element("vah264enc")) {
+    const std::string pref = hw_preference();
+    if (allow_hw && (pref.empty() || pref == "nv") && has_element("nvh264dec") && has_element("nvh264enc")) {
+        hw_used = true;
+        label = "NVIDIA (NVDEC + NVENC): dekodieren + kodieren auf der Grafikkarte";
+        return "h264parse ! nvh264dec ! nvh264enc name=venc bitrate=" + std::to_string(kbps) +
+               " gop-size=50 zerolatency=true";
+    }
+    if (allow_hw && pref != "sw" && pref != "nv" && has_element("vah264dec") && has_element("vapostproc") &&
+        has_element("vah264enc")) {
         hw_used = true;
         label = "Quick Sync (va): dekodieren + kodieren auf der Grafikeinheit";
         return "h264parse ! vah264dec ! vapostproc ! video/x-raw(memory:VAMemory),format=NV12 ! "
                "vah264enc name=venc bitrate=" + std::to_string(kbps) + " key-int-max=50";
     }
-    if (allow_hw && has_element("vaapih264dec") && has_element("vaapipostproc") && has_element("vaapih264enc")) {
+    if (allow_hw && pref != "sw" && pref != "nv" && has_element("vaapih264dec") && has_element("vaapipostproc") &&
+        has_element("vaapih264enc")) {
         hw_used = true;
         label = "Quick Sync (vaapi): dekodieren + kodieren auf der Grafikeinheit";
         return "h264parse ! vaapih264dec ! vaapipostproc format=nv12 ! vaapih264enc name=venc bitrate=" +
@@ -301,7 +314,7 @@ bool init_playout_pipeline(PlayoutEngine& eng, int output_mode, int srt_out_port
         std::cerr << "[Fehler] Pipeline " << eng.name << ": " << (err ? err->message : "Unbekannt") << "\n";
         if (err) g_error_free(err);
         if (eng.pipeline) { gst_object_unref(eng.pipeline); eng.pipeline = nullptr; }
-        if (eng.hw_chain) {  // Quick-Sync-Kette lässt sich nicht aufbauen: Software
+        if (eng.hw_chain) {  // Hardware-Kette lässt sich nicht aufbauen: Software
             std::cerr << "[Warnung] " << eng.name << " läuft in Software\n";
             return init_playout_pipeline(eng, output_mode, srt_out_port, decklink_dev, audio_to_speakers, false);
         }
@@ -331,14 +344,14 @@ bool init_playout_pipeline(PlayoutEngine& eng, int output_mode, int srt_out_port
     gst_caps_unref(acaps);
 
     if (gst_element_set_state(eng.pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE && eng.hw_chain) {
-        std::cerr << "[Warnung] Quick-Sync-Kette startet nicht – " << eng.name << " läuft in Software\n";
+        std::cerr << "[Warnung] Hardware-Kette startet nicht – " << eng.name << " läuft in Software\n";
         teardown_pipeline(eng);
         return init_playout_pipeline(eng, output_mode, srt_out_port, decklink_dev, audio_to_speakers, false);
     }
     return true;
 }
 
-// Meldet die Quick-Sync-Kette im Betrieb einen Fehler (z.B. Format nicht unterstützt), auf Software umbauen.
+// Meldet die Hardware-Kette im Betrieb einen Fehler (z.B. Format nicht unterstützt), auf Software umbauen.
 // Aufruf aus dem 50-Hz-Takt (unter g_mx), etwa einmal pro Sekunde.
 static void check_hw_errors(PlayoutEngine& eng) {
     if (!eng.pipeline || !eng.hw_chain) return;
@@ -348,7 +361,7 @@ static void check_hw_errors(PlayoutEngine& eng) {
     if (!m) return;
     GError* e = nullptr;
     gst_message_parse_error(m, &e, nullptr);
-    std::fprintf(stderr, "\n[Warnung] %s Quick Sync: %s – schalte auf Software um\n", eng.name.c_str(),
+    std::fprintf(stderr, "\n[Warnung] %s Hardware: %s – schalte auf Software um\n", eng.name.c_str(),
                  e ? e->message : "Fehler");
     if (e) g_error_free(e);
     gst_message_unref(m);
